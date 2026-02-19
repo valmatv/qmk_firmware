@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"c:/QMK_MSYS/usr/bin/pacman.exe\" -Syu:*)",
+      "Bash(\"C:/QMK_MSYS/usr/bin/bash.exe\":*)",
+      "Bash(\"C:/QMK_MSYS/usr/bin/bash.exe\" -l -c \"python -c ''from qmk_cli.script_qmk import main; print\\(\"\"OK\"\"\\)'' 2>&1\")",
+      "Bash(\"C:/QMK_MSYS/usr/bin/bash.exe\" -l -c \"cp -rn /mingw64/lib/python3.9/site-packages/* /mingw64/lib/python3.14/site-packages/ 2>&1 && echo done\")"
+    ]
+  }
+}
