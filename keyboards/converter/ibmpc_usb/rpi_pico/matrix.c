@@ -100,13 +100,17 @@ bool matrix_is_on(uint8_t row, uint8_t col) {
 }
 
 static inline void matrix_make(uint8_t code) {
-    if (!matrix_is_on(ROW(code), COL(code)))
+    if (!matrix_is_on(ROW(code), COL(code))) {
         matrix[ROW(code)] |= 1 << COL(code);
+        dprintf("MK %02X (r%d,c%d)\n", code, ROW(code), COL(code));
+    }
 }
 
 static inline void matrix_break(uint8_t code) {
-    if (matrix_is_on(ROW(code), COL(code)))
+    if (matrix_is_on(ROW(code), COL(code))) {
         matrix[ROW(code)] &= ~(1 << COL(code));
+        dprintf("BK %02X (r%d,c%d)\n", code, ROW(code), COL(code));
+    }
 }
 
 void matrix_clear(void) {
@@ -119,7 +123,7 @@ void matrix_clear(void) {
 static void clear_stuck_keys(void) {
     matrix_clear();
     clear_keyboard();
-    xprintf("\n[CLR] ");
+    xprintf("\n[CLR] stuck keys cleared\n");
 }
 
 /******************************************************************************
@@ -877,12 +881,14 @@ static void process_interface(void) {
 
 void matrix_init(void) {
     debug_enable     = true;
+    debug_matrix     = false;  /* per-scan matrix diff — too noisy; toggle via IS_COMMAND() */
     keyboard_id      = 0x0000;
     keyboard_kind    = PC_NONE;
     current_protocol = 0;
     converter_state  = STATE_INIT;
     matrix_clear();
     ibmpc_host_init();
+    xprintf("[INIT] IBM PC USB converter ready\n");
     matrix_init_kb();
 }
 
@@ -927,6 +933,9 @@ bool led_update_kb(led_t led_state) {
         if (led_state.scroll_lock) ibmpc_led |= (1 << IBMPC_LED_SCROLL_LOCK);
         if (led_state.num_lock)    ibmpc_led |= (1 << IBMPC_LED_NUM_LOCK);
         if (led_state.caps_lock)   ibmpc_led |= (1 << IBMPC_LED_CAPS_LOCK);
+        dprintf("LED scr=%d num=%d cap=%d -> ibmpc=0x%02X\n",
+                led_state.scroll_lock, led_state.num_lock,
+                led_state.caps_lock, ibmpc_led);
         ibmpc_host_set_led(ibmpc_led);
     }
     return res;
