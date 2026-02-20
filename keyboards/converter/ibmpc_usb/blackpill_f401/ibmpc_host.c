@@ -34,27 +34,27 @@ POSSIBILITY OF SUCH DAMAGE.
 */
 
 /*
- * IBM PC Keyboard Protocol Host Driver for RP2040 (ChibiOS)
+ * IBM PC Keyboard Protocol Host Driver — STM32F401 (ChibiOS/PAL)
  *
- * Supports both XT (Scan Code Set 1) and AT/PS2 (Scan Code Set 2) protocols
- * with auto-detection on startup.
+ * Ported from the RP2040 version.  The host logic (ring buffer, XT/PS2 ISR
+ * state machines, send/receive protocol) is identical.  The only platform
+ * differences are:
  *
- * Detection strategy:
- *   1. Inhibit the bus (pull clock low) for 100ms, then release.
- *   2. Try to send PS/2 Reset command (0xFF).
- *   3. If we get ACK (0xFA) -> AT/PS2 protocol detected.
- *   4. If timeout (no ACK) -> XT protocol assumed.
- *   5. As a fallback, count clock pulses per frame during initial reception:
- *      - 10 clocks = XT frame
- *      - 11 clocks = PS/2 frame
+ *   1. Interrupt registration order: on STM32/ChibiOS the PAL callback
+ *      MUST be registered with palSetLineCallback() BEFORE the event is
+ *      enabled with palEnableLineEvent().  The RP2040 port tolerates either
+ *      order, but STM32 does not.
  *
- * Frame formats:
- *   XT:   [Start(0)] Start(1) D0 D1 D2 D3 D4 D5 D6 D7
- *         10 clock pulses, data sampled on falling edge, no parity.
- *         Note: Start(0) may be absent on some clones.
+ *   2. ibmpc_int_init() calls palSetLineMode() directly (same as RP2040)
+ *      to configure the clock pin as input with pull-up.
  *
- *   PS/2: Start(0) D0 D1 D2 D3 D4 D5 D6 D7 Parity Stop(1)
- *         11 clock pulses, data sampled on falling edge, odd parity.
+ * Supports:
+ *   - XT  (Scan Code Set 1, 10-bit frame, 83/84/86-key)
+ *   - AT/PS2 (Scan Code Set 2, 11-bit frame)
+ *   - Terminal keyboards (Scan Code Set 3) via matrix.c state machine
+ *
+ * Protocol detection is driven by the matrix.c state machine
+ * (ibmpc_host_enable / ibmpc_host_set_protocol / ibmpc_host_keyboard_id).
  */
 
 #include <stdbool.h>
@@ -135,7 +135,7 @@ static void xt_isr(void) {
 
     switch (state) {
         case XT_START:
-            // Ignore start(0) bit (data=low), wait for start(1) bit (data=high)
+            /* Ignore start(0) bit (data=low), wait for start(1) bit (data=high) */
             if (!dbit) return;
             break;
         case XT_BIT0 ... XT_BIT7:
@@ -168,7 +168,7 @@ static void ps2_isr(void) {
     static uint8_t data   = 0;
     static uint8_t parity = 1;
 
-    // Return unless falling edge (safety check if using PCINT-like interrupts)
+    /* Safety check: only process on falling edge (clock should be low) */
     if (IBMPC_CLOCK_READ()) {
         return;
     }
@@ -210,7 +210,7 @@ static void ps2_isr(void) {
 ERROR:
     ibmpc_isr_debug = state;
     /* AT/XT Auto-Switching: a parity error on 0xAA means an XT keyboard sent
-     * its power-on code using XT framing, which looks like a bad PS/2 byte. */
+     * its power-on code using XT framing, which looks like a PS/2 byte. */
     ibmpc_error = (data == 0xAA) ? IBMPC_ERR_PARITY_AA : IBMPC_ERR_PARITY;
 DONE:
     state  = PS2_INIT;
@@ -218,53 +218,8 @@ DONE:
     parity = 1;
 }
 
-/* detect_isr, detect_reset_isr_state, and their state variables are only
- * used by detect_protocol() which is disabled.  Guard them to avoid
- * -Werror=unused-function build failures.
- */
-#if 0
 /*--------------------------------------------------------------------
- * Detection-phase ISR
- *
- * During detection, we count clock pulses per frame using a timeout
- * to detect frame boundaries. If we see 10 clocks per frame -> XT.
- * If we see 11 clocks per frame -> PS/2.
- *------------------------------------------------------------------*/
-static volatile uint8_t detect_clock_count = 0;
-static volatile uint8_t detect_data_byte   = 0;
-static volatile bool    detect_frame_ready = false;
-
-static void detect_isr(void) {
-    static uint8_t bit_count = 0;
-    static uint8_t data      = 0;
-
-    uint8_t dbit = IBMPC_DATA_READ();
-
-    bit_count++;
-
-    // Accumulate data bits (skip start bits, collect up to 8 data bits)
-    if (bit_count >= 2 && bit_count <= 9) {
-        data >>= 1;
-        if (dbit) data |= 0x80;
-    }
-
-    // We'll let the main loop check for frame completion via timeout
-    detect_clock_count = bit_count;
-    detect_data_byte   = data;
-
-    // Reset on long idle (will be handled by main loop calling detect_reset)
-    (void)data;
-}
-
-static void detect_reset_isr_state(void) {
-    detect_clock_count = 0;
-    detect_data_byte   = 0;
-    detect_frame_ready = false;
-}
-#endif /* 0 — detection-phase helpers */
-
-/*--------------------------------------------------------------------
- * ChibiOS PAL interrupt callback
+ * ChibiOS PAL interrupt callback (called from EXTI IRQ handler)
  *------------------------------------------------------------------*/
 typedef void (*isr_func_t)(void);
 static volatile isr_func_t active_isr = NULL;
@@ -278,14 +233,20 @@ static void ibmpc_pal_callback(void *arg) {
 
 /*--------------------------------------------------------------------
  * Interrupt control
+ *
+ * STM32/ChibiOS IMPORTANT: palSetLineCallback() MUST be called before
+ * palEnableLineEvent().  The RP2040 port tolerates the reverse order,
+ * but STM32 EXTI will miss the first edge if the callback is not yet
+ * registered when the event is armed.
  *------------------------------------------------------------------*/
 static void ibmpc_int_init(void) {
     palSetLineMode(IBMPC_CLOCK_PIN, PAL_MODE_INPUT_PULLUP);
 }
 
 static void ibmpc_int_on(void) {
-    palEnableLineEvent(IBMPC_CLOCK_PIN, PAL_EVENT_MODE_FALLING_EDGE);
+    /* Register callback FIRST, then arm the falling-edge event */
     palSetLineCallback(IBMPC_CLOCK_PIN, ibmpc_pal_callback, NULL);
+    palEnableLineEvent(IBMPC_CLOCK_PIN, PAL_EVENT_MODE_FALLING_EDGE);
 }
 
 static void ibmpc_int_off(void) {
@@ -296,34 +257,22 @@ static void ibmpc_int_off(void) {
  * Wait helpers for PS/2 bit-bang send
  *------------------------------------------------------------------*/
 static inline uint16_t wait_clock_lo(uint16_t us) {
-    while (IBMPC_CLOCK_READ() && us) {
-        wait_us(1);
-        us--;
-    }
+    while (IBMPC_CLOCK_READ() && us) { wait_us(1); us--; }
     return us;
 }
 
 static inline uint16_t wait_clock_hi(uint16_t us) {
-    while (!IBMPC_CLOCK_READ() && us) {
-        wait_us(1);
-        us--;
-    }
+    while (!IBMPC_CLOCK_READ() && us) { wait_us(1); us--; }
     return us;
 }
 
 static inline uint16_t wait_data_lo(uint16_t us) {
-    while (IBMPC_DATA_READ() && us) {
-        wait_us(1);
-        us--;
-    }
+    while (IBMPC_DATA_READ() && us) { wait_us(1); us--; }
     return us;
 }
 
 static inline uint16_t wait_data_hi(uint16_t us) {
-    while (!IBMPC_DATA_READ() && us) {
-        wait_us(1);
-        us--;
-    }
+    while (!IBMPC_DATA_READ() && us) { wait_us(1); us--; }
     return us;
 }
 
@@ -342,17 +291,17 @@ static uint8_t ibmpc_ps2_send(uint8_t data) {
 
     ibmpc_int_off();
 
-    // Inhibit: pull clock low for at least 100us
+    /* Inhibit: pull clock low for at least 100 µs */
     IBMPC_INHIBIT();
     wait_us(100);
 
-    // Request to Send: pull data low, then release clock
+    /* Request to Send: pull data low, then release clock */
     IBMPC_DATA_LO();
     IBMPC_CLOCK_HI();
-    send_step = 1; /* waiting for device to pull clock low */
+    send_step = 1;
     if (!wait_clock_lo(10000)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
 
-    // Clock out 8 data bits (LSB first)
+    /* Clock out 8 data bits (LSB first) */
     for (uint8_t i = 0; i < 8; i++) {
         if (data & (1 << i)) {
             parity_bit = !parity_bit;
@@ -360,49 +309,47 @@ static uint8_t ibmpc_ps2_send(uint8_t data) {
         } else {
             IBMPC_DATA_LO();
         }
-        send_step = (uint8_t)(2 + i * 2); /* clk hi for bit i */
+        send_step = (uint8_t)(2 + i * 2);
         if (!wait_clock_hi(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
-        send_step = (uint8_t)(3 + i * 2); /* clk lo for bit i */
+        send_step = (uint8_t)(3 + i * 2);
         if (!wait_clock_lo(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
     }
 
-    // Parity bit
+    /* Parity bit */
     wait_us(15);
     if (parity_bit) {
         IBMPC_DATA_HI();
     } else {
         IBMPC_DATA_LO();
     }
-    send_step = 18; /* clk hi for parity */
+    send_step = 18;
     if (!wait_clock_hi(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
-    send_step = 19; /* clk lo for parity */
+    send_step = 19;
     if (!wait_clock_lo(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
 
-    // Stop bit
+    /* Stop bit */
     wait_us(15);
     IBMPC_DATA_HI();
 
-    // Wait for ACK from device
-    send_step = 20; /* data lo ACK */
-    if (!wait_data_lo(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
-    send_step = 21; /* clk lo during ACK */
+    /* Wait for ACK from device */
+    send_step = 20;
+    if (!wait_data_lo(50))  { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
+    send_step = 21;
     if (!wait_clock_lo(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
 
-    // Wait for idle
-    send_step = 22; /* clk hi idle */
+    /* Wait for idle */
+    send_step = 22;
     if (!wait_clock_hi(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
-    send_step = 23; /* data hi idle */
-    if (!wait_data_hi(50)) { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
+    send_step = 23;
+    if (!wait_data_hi(50))  { ibmpc_error = IBMPC_ERR_TIMEOUT; goto ERROR; }
 
     IBMPC_IDLE();
     ibmpc_int_on();
 
-    // Wait for response byte
+    /* Wait for keyboard response byte */
     {
         uint8_t retry = 25;
-        while (retry-- && !pbuf_has_data()) {
-            wait_ms(1);
-        }
+        while (retry-- && !pbuf_has_data()) { wait_ms(1); }
         uint8_t resp = pbuf_dequeue();
         dprintf("PS2 resp 0x%02X\n", resp);
         return resp;
@@ -415,127 +362,19 @@ ERROR:
     return 0;
 }
 
-/* detect_protocol() removed: protocol detection is now driven by the
- * matrix.c state machine (ibmpc_host_enable / set_protocol / keyboard_id).
- * This stub keeps the compiler happy if any reference remains.
- * TODO: delete this comment block once confirmed unused.
- */
-#if 0
-static enum ibmpc_protocol detect_protocol(void) {
-    uint8_t response;
-
-    dprintf("IBMPC: detecting protocol...\n");
-
-    // Inhibit bus to reset keyboard communication
-    IBMPC_INHIBIT();
-    wait_ms(100);
-    IBMPC_IDLE();
-
-    // Brief settling time
-    wait_ms(50);
-
-    // Enable interrupt with PS/2 ISR to catch ACK
-    active_isr = ps2_isr;
-    ibmpc_int_on();
-
-    // Try sending PS/2 Reset command
-    response = ibmpc_ps2_send(IBMPC_CMD_RESET);
-    dprintf("IBMPC: reset response=0x%02X\n", response);
-
-    if (response == IBMPC_ACK) {
-        // Got ACK - this is a PS/2 keyboard
-        dprintf("IBMPC: AT/PS2 detected (got ACK)\n");
-
-        // Wait for BAT result (0xAA = OK, 0xFC = error)
-        // BAT can take up to 2.5 seconds
-        uint16_t retry = 2500;
-        while (retry-- && !pbuf_has_data()) {
-            wait_ms(1);
-        }
-        uint8_t bat = pbuf_dequeue();
-        dprintf("IBMPC: BAT=0x%02X\n", bat);
-        // Zenith Z-150 does not respond to ID command — keep as plain AT
-        return IBMPC_PROTOCOL_AT;
-    }
-
-    // No ACK - likely XT keyboard. Try the XT reset approach.
-    dprintf("IBMPC: no ACK, trying XT reset...\n");
-    ibmpc_int_off();
-    pbuf_clear();
-
-    // XT soft reset: pull data and clock low for 20ms
-    IBMPC_DATA_LO();
-    IBMPC_CLOCK_LO();
-    wait_ms(20);
-
-    // Release and listen
-    IBMPC_IDLE();
-    wait_ms(50);
-
-    // Switch to detection ISR to count bits per frame
-    detect_reset_isr_state();
-    active_isr = detect_isr;
-    ibmpc_int_on();
-
-    // Wait for first frame (XT keyboards send BAT/power-on scan codes)
-    uint16_t timeout = 3000; // 3 seconds
-    uint8_t last_count = 0;
-    uint16_t idle_ms = 0;
-
-    while (timeout--) {
-        wait_ms(1);
-        uint8_t count = detect_clock_count;
-
-        if (count > 0 && count == last_count) {
-            idle_ms++;
-            // If no new clock for 2ms after receiving some clocks, frame is complete
-            if (idle_ms >= 2) {
-                dprintf("IBMPC: detect frame clocks=%d\n", count);
-                if (count >= 10 && count <= 11) {
-                    ibmpc_int_off();
-                    if (count == 11) {
-                        dprintf("IBMPC: AT/PS2 detected (11-bit frame)\n");
-                        return IBMPC_PROTOCOL_AT;
-                    } else {
-                        dprintf("IBMPC: XT detected (10-bit frame)\n");
-                        return IBMPC_PROTOCOL_XT_CLONE;
-                    }
-                } else if (count >= 8 && count <= 9) {
-                    // Some XT clones send 9-bit frames (skip start(0))
-                    ibmpc_int_off();
-                    dprintf("IBMPC: XT detected (%d-bit frame)\n", count);
-                    return IBMPC_PROTOCOL_XT_CLONE;
-                }
-                // Unexpected count, reset and keep listening
-                detect_reset_isr_state();
-                idle_ms = 0;
-            }
-        } else {
-            idle_ms = 0;
-        }
-        last_count = count;
-    }
-
-    ibmpc_int_off();
-
-    // Timeout with no response - default to XT (keyboard may need manual key press)
-    dprintf("IBMPC: detection timeout, defaulting to XT\n");
-    return IBMPC_PROTOCOL_XT_CLONE;
-}
-#endif /* 0 — detect_protocol() */
-
 /*--------------------------------------------------------------------
  * Public API
  *------------------------------------------------------------------*/
 
 void ibmpc_host_init(void) {
-    /* Minimal hardware setup.  Protocol detection and ISR start are delegated
-     * to the matrix.c state machine via ibmpc_host_enable() / host_disable(). */
+    /* Minimal hardware setup.  Protocol detection and ISR start are
+     * delegated to the matrix.c state machine via ibmpc_host_enable()
+     * and ibmpc_host_disable(). */
     ibmpc_int_init();
 
     pbuf_clear();
-    ibmpc_error     = IBMPC_ERR_NONE;
-    ibmpc_isr_debug = 0;
+    ibmpc_error       = IBMPC_ERR_NONE;
+    ibmpc_isr_debug   = 0;
     detected_protocol = IBMPC_PROTOCOL_UNKNOWN;
 
     /* Pre-load PS/2 ISR so ibmpc_host_enable() starts in AT mode by default.
@@ -545,12 +384,12 @@ void ibmpc_host_init(void) {
     /* Inhibit the keyboard until the state machine is ready */
     IBMPC_INHIBIT();
 
-    dprintf("IBMPC: host init (state machine will drive detection)\n");
+    dprintf("IBMPC: host init (STM32F401, state machine drives detection)\n");
 }
 
 /*
  * ibmpc_host_recv() — non-blocking receive.
- * Returns 0 if no data available (caller must check pbuf state separately).
+ * Returns scan code (0x00–0xFF) or -1 if buffer is empty.
  */
 int16_t ibmpc_host_recv(void) {
     if (pbuf_has_data()) {
@@ -562,7 +401,6 @@ int16_t ibmpc_host_recv(void) {
 /*
  * ibmpc_host_recv_wait() — blocking receive with timeout.
  * Returns byte value (0x00–0xFF) or -1 on timeout.
- * Mirrors TMK IBMPCConverter::read_wait().
  */
 int16_t ibmpc_host_recv_wait(uint16_t timeout_ms) {
     uint16_t start = timer_read();
@@ -574,18 +412,17 @@ int16_t ibmpc_host_recv_wait(uint16_t timeout_ms) {
 
 /*
  * ibmpc_host_keyboard_id() — send 0xF2 and read the 2-byte keyboard ID.
- * Returns 16-bit ID or a sentinel:
+ * Returns 16-bit ID or sentinel values:
  *   0xFFFF  No keyboard / XT (no ACK)
  *   0xFFFE  Broken PS/2 (ACK but no first byte)
  *   0x0000  IBM 84-key AT (ACK, no bytes follow)
  *   0x00FF  PS/2 Mouse
- * Mirrors TMK read_keyboard_id().
  */
 uint16_t ibmpc_host_keyboard_id(void) {
     uint16_t id   = 0;
     int16_t  code = 0;
 
-    /* protocol-based shortcuts */
+    /* Protocol-based shortcuts — skip the ID command for known XT variants */
     if (detected_protocol == IBMPC_PROTOCOL_AT_Z150)  { dprintf("IBMPC: kbd_id shortcut Z150->0xFFFD\n");   return 0xFFFD; }
     if (detected_protocol == IBMPC_PROTOCOL_XT_IBM)   { dprintf("IBMPC: kbd_id shortcut XT_IBM->0xFFFC\n"); return 0xFFFC; }
     if (detected_protocol == IBMPC_PROTOCOL_XT_CLONE) { dprintf("IBMPC: kbd_id shortcut XT_CLONE->0xFFFB\n"); return 0xFFFB; }
@@ -602,7 +439,7 @@ uint16_t ibmpc_host_keyboard_id(void) {
     dprintf("IBMPC: kbd_id byte1=0x%02X\n", (uint8_t)code);
     id = (uint16_t)((code & 0xFF) << 8);
 
-    /* Mouse sends only one byte (0x00); that gives id=0x00FF below */
+    /* Mouse sends only one byte (0x00); gives id=0x00FF */
     code = ibmpc_host_recv_wait(500);
     dprintf("IBMPC: kbd_id byte2=0x%02X\n", (uint8_t)code);
     id |= (uint16_t)(code & 0xFF);
@@ -632,7 +469,6 @@ void ibmpc_host_disable(void) {
 
 /*
  * ibmpc_host_isr_clear() — flush the receive ring buffer.
- * Called before sending commands during initialisation.
  */
 void ibmpc_host_isr_clear(void) {
     pbuf_clear();
@@ -645,7 +481,7 @@ void ibmpc_host_isr_clear(void) {
 uint8_t ibmpc_host_error(void) {
     uint8_t err;
     chSysLock();
-    err        = ibmpc_error;
+    err         = ibmpc_error;
     ibmpc_error = IBMPC_ERR_NONE;
     chSysUnlock();
     return err;
@@ -667,7 +503,7 @@ void ibmpc_host_set_protocol(enum ibmpc_protocol proto) {
     dprintf("IBMPC: set_protocol %d (%s)\n", proto,
             IBMPC_PROTOCOL_IS_AT(proto) ? "PS/2" : "XT");
     detected_protocol = proto;
-    /* Switch ISR to match */
+    /* Switch ISR to match the new protocol */
     ibmpc_int_off();
     pbuf_clear();
     if (IBMPC_PROTOCOL_IS_AT(proto)) {
@@ -680,7 +516,7 @@ void ibmpc_host_set_protocol(enum ibmpc_protocol proto) {
 
 void ibmpc_host_set_led(uint8_t led) {
     if (!IBMPC_PROTOCOL_IS_AT(detected_protocol)) {
-        return; // XT keyboards don't support LED commands
+        return; /* XT keyboards do not support LED commands */
     }
     ibmpc_host_send(IBMPC_CMD_SET_LED);
     ibmpc_host_send(led);
